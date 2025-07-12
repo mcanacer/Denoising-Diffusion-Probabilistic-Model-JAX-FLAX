@@ -1,5 +1,6 @@
 import sys
 import importlib
+import os
 
 import jax
 import jax.numpy as jnp
@@ -13,6 +14,18 @@ def get_everything(config_path, args):
     module_path = config_path.replace('/', '.').replace('.py', '')
     module = importlib.import_module(module_path, package=None)
     return module.everything(args)
+
+
+def save_checkpoint(path, state):
+    with open(path, "wb") as f:
+        f.write(serialization.to_bytes(state))
+
+
+def load_checkpoint(path, state_template):
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        return serialization.from_bytes(state_template, f.read())
 
 
 def ema_update(ema_params, new_params, decay):
@@ -29,9 +42,9 @@ def make_update_fn(*, apply_fn, optimizer, sampler, ema_decay):
             noisy_image, noise = sampler.add_noise(rng, images, timesteps)
             predicted_noise = apply_fn(params, noisy_image, timesteps)
 
-            loss = jnp.sum((predicted_noise - noise) ** 2, axis=(-2, -1))
+            loss = jnp.sum((predicted_noise - noise) ** 2)
 
-            return loss.mean()
+            return loss
 
         loss, grad = jax.value_and_grad(loss_fn)(params)
 
@@ -81,7 +94,7 @@ def main(config_path, args):
     replicate = lambda tree: jax.device_put_replicated(tree, devices)
     unreplicate = lambda tree: jax.tree_util.tree_map(lambda x: x[0], tree)
 
-    ema_decay = 0.999
+    ema_decay = 0.9999
     ema_params = params
     ema_params_repl = replicate(ema_params)
 
@@ -95,6 +108,25 @@ def main(config_path, args):
 
     num_devices = jax.local_device_count()
 
+    state_template = {
+        "params": unreplicate(params_repl),
+        "opt_state": unreplicate(opt_state_repl),
+        "ema_params": unreplicate(ema_params_repl),
+        "epoch": 0,
+        "rng": key,
+    }
+
+    loaded_state = load_checkpoint(checkpoint_path, state_template)
+    if loaded_state is not None:
+        print("Resuming from checkpoint...")
+        params_repl = replicate(loaded_state["params"])
+        opt_state_repl = replicate(loaded_state["opt_state"])
+        ema_params_repl = replicate(loaded_state["ema_params"])
+        key = loaded_state["rng"]
+        start_epoch = loaded_state["epoch"] + 1
+    else:
+        start_epoch = 0
+
     def shard(x):
         n, *s = x.shape
         return np.reshape(x, (num_devices, n // num_devices, *s))
@@ -103,7 +135,7 @@ def main(config_path, args):
         num_devices, batch_size, *shape = inputs.shape
         return jnp.reshape(inputs, (num_devices * batch_size, *shape))
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         for step, images in enumerate(train_loader):
             key, time_rng, sample_rng = jax.random.split(key, 3)
             timesteps = jax.random.randint(time_rng, minval=0, maxval=sampler.total_timesteps, shape=(images.shape[0],))
@@ -132,10 +164,14 @@ def main(config_path, args):
                 "total_loss": loss,
                 "epoch": epoch})
 
-        bytes_output = serialization.to_bytes(unreplicate(ema_params_repl))
-
-        with open(checkpoint_path, "wb") as f:
-            f.write(bytes_output)
+        checkpoint_state = {
+            "params": unreplicate(params_repl),
+            "opt_state": unreplicate(opt_state_repl),
+            "ema_params": unreplicate(ema_params_repl),
+            "epoch": epoch,
+            "rng": key,
+        }
+        save_checkpoint(checkpoint_path, checkpoint_state)
 
 
 if __name__ == '__main__':

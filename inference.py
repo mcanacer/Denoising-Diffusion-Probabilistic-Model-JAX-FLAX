@@ -1,5 +1,6 @@
 import sys
 import importlib
+import os
 
 import torch
 import numpy as np
@@ -16,11 +17,18 @@ def get_everything(config_path, args):
     return module.everything(args)
 
 
-def generate_samples(rng, model, model_params, sampler, shape):
+def load_checkpoint(path):
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        return serialization.from_bytes(None, f.read())
+
+
+def generate_samples(rng, model, model_params, sampler, shape, num_steps):
     def make_predict_fn(*, apply_fn, sampler):
-        def predict_fn(params, rng, xt, timesteps):
-            predicted_noise = apply_fn(params, xt, timesteps)
-            xt_prev = sampler.remove_noise(rng, xt, predicted_noise, timesteps)
+        def predict_fn(params, rng, xt, t, t_prev):
+            predicted_noise = apply_fn(params, xt, t)
+            xt_prev = sampler.remove_noise(rng, xt, predicted_noise, t, t_prev)
             return xt_prev
 
         return jax.pmap(predict_fn, axis_name='batch', donate_argnums=())
@@ -44,16 +52,20 @@ def generate_samples(rng, model, model_params, sampler, shape):
     rng, sample_rng = jax.random.split(rng, 2)
 
     xt = jax.random.normal(sample_rng, shape=shape)
+    timesteps = jnp.arange(0, sampler.total_timesteps, sampler.total_timesteps // num_steps)[::-1]
+    timesteps_prev = jnp.concatenate([timesteps[1:], jnp.array([0], dtype=jnp.int32)], axis=0)
 
-    for t in reversed(range(sampler.total_timesteps)):
+    for i in range(len(timesteps)):
         rng, sample_rng = jax.random.split(rng, 2)
-        timesteps = jnp.full(shape=(xt.shape[0],), fill_value=t, dtype=jnp.int32)
+        t = jnp.full((shape[0],), timesteps[i], dtype=jnp.int32)
+        t_prev = jnp.full((shape[0],), timesteps_prev[i], dtype=jnp.int32)
 
         xt = jax.tree_util.tree_map(lambda x: shard(x), xt)
-        timesteps = jax.tree_util.tree_map(lambda x: shard(x), timesteps)
+        t = jax.tree_util.tree_map(lambda x: shard(x), t)
+        t_prev = jax.tree_util.tree_map(lambda x: shard(x), t_prev)
         rng_shard = jax.random.split(sample_rng, num_devices)
 
-        xt = predict_fn(params_repl, rng_shard, xt, timesteps)
+        xt = predict_fn(params_repl, rng_shard, xt, t, t_prev)
         xt = jax.tree_util.tree_map(lambda x: unshard(x), xt)
 
     x0 = xt  # [N, H, W, 3]
@@ -76,14 +88,16 @@ def main(config_path, args):
     sampler = evy['sampler']
 
     checkpoint_path = evy['diffusion_path']
+    num_steps = evy['num_steps']
     num_samples = evy['num_samples']
 
     shape = (num_samples, image_size, image_size, 3)
 
-    with open(checkpoint_path, 'rb') as f:
-        model_params = serialization.from_bytes(None, f.read())
+    loaded_state = load_checkpoint(checkpoint_path)
+    params = loaded_state["params"]
+    ema_params = loaded_state["ema_params"]
 
-    x_gen = generate_samples(key, model, model_params, sampler, shape)
+    x_gen = generate_samples(key, model, ema_params, sampler, shape, num_steps)
 
     for i in range(x_gen.shape[0]):
         img = np.array(x_gen[i])

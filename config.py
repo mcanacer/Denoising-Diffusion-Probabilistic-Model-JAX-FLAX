@@ -5,14 +5,14 @@ from datasets import load_dataset
 from dataset import HuggingFace
 import wandb
 from model import UNet
-from sampler import Sampler
+from sampler import DDPMSampler, DDIMSampler
 import optax
 
 
 def parse_args(args):
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--seed', type=int, default=61)
 
     # Dataset
     parser.add_argument('--image-size', type=int, default=128)
@@ -27,9 +27,12 @@ def parse_args(args):
     parser.add_argument('--num-epochs', type=int, default=100)
 
     # Sampler
-    parser.add_argument('--total-timesteps', type=int, default=250)
+    parser.add_argument('--sampler-type', type=str, default='DDPM')
+    parser.add_argument('--total-timesteps', type=int, default=1000)
     parser.add_argument('--beta-start', type=float, default=0.0001)
     parser.add_argument('--beta-end', type=float, default=0.02)
+    parser.add_argument('--schedule_type', type=str, default='linear')
+    parser.add_argument('--num-steps', type=int, default=1000)
 
     # Wandb
     parser.add_argument('--project', type=str, default='DDPM')
@@ -56,7 +59,7 @@ def everything(args):
     ])
 
     train_dataset = HuggingFace(
-      dataset=load_dataset("bitmind/ffhq-256", split='train'),
+      dataset=load_dataset("flwrlabs/celeba", split='train'),
       transform=transform,
     )
 
@@ -83,10 +86,16 @@ def everything(args):
         eps=1e-8,
     ))
 
-    sampler = Sampler(
+    sampler_cls = {
+        'DDPM': DDPMSampler,
+        'DDIM': DDIMSampler,
+    }.get(args.sampler_type)
+
+    sampler = sampler_cls(
         total_timesteps=args.total_timesteps,
         beta_start=args.beta_start,
         beta_end=args.beta_end,
+        schedule_type=args.schedule_type,
     )
 
     epochs = args.num_epochs
@@ -109,4 +118,5 @@ def everything(args):
         'run': run,
         'diffusion_path': args.diffusion_path,
         'num_samples': args.num_samples,
+        'num_steps': args.num_steps,
     }
